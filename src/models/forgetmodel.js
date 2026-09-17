@@ -13,4 +13,6 @@ const forgetSchema = new mongoose.Schema({
         required:true,
         max:9999
     }
-})
+},{timestamps:true})
+
+export default mongoose.model("forget",forgetSchema)
