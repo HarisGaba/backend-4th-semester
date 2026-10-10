@@ -48,9 +48,23 @@ const Register= async (req,res)=>{
         catch(e){
             return res.status(400).json({error:e})
         }
-
-
     }
 
+const allUsers = async (req, res) => {
+  try {
+    const allUsers = await User.find()
+    if (allUsers) {
+      return res.status(200).json
+      ({ msg: "all users", allUsers })
+    } else {
+      return res.status(404).json
+      ({ msg: "no user found" })
+    }
+  } catch (error) {
+    return res.status(404).json
+    ({ error: error })
+  }
+}
 
-export {Login,Register}
+
+export {Login,Register,allUsers}
