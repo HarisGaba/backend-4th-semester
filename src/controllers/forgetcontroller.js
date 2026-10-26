@@ -1,86 +1,194 @@
-import User from "../models/authmodel.js";
-import forgetmodel from "../models/forgetmodel.js";
-import otpGenerator from "otp-generator";
+import "dotenv/config";
+import { randomBytes, createHash } from "node:crypto";
 import bcrypt from "bcrypt";
+import User from "../models/authmodel.js";
+import sendEmail from "../configs/mailerconfig.js";
 
-const verifyemail = async (req, res) => {
-    try {
-        const { email } = req.body;
-        
-        if (!email) {
-            return res.status(400).json({ error: "Please fill all the fields" });
-        } 
+function hashToken(token) {
+  return createHash("sha256").update(token).digest("hex");
+}
 
-        const exist = await User.findOne({ email });
-        
-        if (!exist) {
-            return res.status(404).json({ error: "Email doesn't exist" });
-        }
+async function verifyemail(req, res) {
+  try {
+    const email =
+      typeof req.body?.email === "string"
+        ? req.body.email.trim().toLowerCase()
+        : "";
 
-        const otp = otpGenerator.generate(4, {
-            upperCaseAlphabets: false,
-            lowerCaseAlphabets: false,
-            specialChars: false
-        });
-        
-        const existingOtp = await forgetmodel.findOne({ email });
-        if (existingOtp) {
-            const updateOtp = await forgetmodel.findByIdAndUpdate(
-                existingOtp._id, { otp }, { new: true }
-            );
-            return res.status(200).json({ msg: "Email exists, OTP updated", updateOtp });
-        } else {
-            const data = await forgetmodel.create({ email, otp });
-            return res.status(200).json({ msg: "OTP sent", data });
-        }
-    } catch (e) {
-        return res.status(500).json({ error: e.message });
+    if (
+      !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ||
+      email.length > 254
+    ) {
+      return res.status(400).json({
+        msg: "Enter a valid email address",
+      });
     }
-};
 
-const verifyOtp = async (req, res) => {
-    try {
-        const { email, otp } = req.body;
-
-        if (!email || !otp) {
-            return res.status(400).json({ error: "please fill all fields" });
-        }
-
-        const check = await forgetmodel.findOne({ email, otp });
-
-        if (check) {
-            return res.status(200).json({ msg: "Otp Verified" });
-        } else {
-            return res.status(400).json({ error: "please add correct otp" });
-        }
-
-    } catch (error) {
-        return res.status(500).json({ error: error.message || "something went wrong" });
+    if (
+      !process.env.FRONTEND_URL ||
+      !process.env.EMAIL_USER ||
+      !process.env.EMAIL_PASS
+    ) {
+      return res.status(503).json({
+        msg: "Password recovery is not configured yet",
+      });
     }
-};
 
-const resetPassword = async (req, res) => {
-    try {
-        const { email, password } = req.body;
-        if (!email || !password) {
-            return res.status(404).json({ error: "please fill all fields" });
-        }
-        const exists = await User.findOne({ email });
-        if (!exists) {
-            return res.status(404).json({ error: "email doesnot exists" });
-        }
+    const frontend = new URL(process.env.FRONTEND_URL);
 
-        const hashedPassword = await bcrypt.hash(password, 10);
-        const updateUser = await User.findByIdAndUpdate(exists._id, { $set: { password: hashedPassword } }, { new: true });
-        if (updateUser) {
-            return res.status(200).json({ msg: "password reset", updateUser });
-        } else {
-            return res.status(400).json({ error: "something went wrong" });
-        }
-
-    } catch (error) {
-        return res.status(500).json({ error: "something went wrong" });
+    if (!["http:", "https:"].includes(frontend.protocol)) {
+      return res.status(503).json({
+        msg: "Password recovery is not configured correctly",
+      });
     }
-};
 
-export { verifyemail, verifyOtp, resetPassword };
+    const token = randomBytes(32).toString("hex");
+    const tokenHash = hashToken(token);
+    const now = new Date();
+    const cooldown = new Date(now.getTime() - 60000);
+
+    const user = await User.findOneAndUpdate(
+      {
+        email,
+        $or: [
+          { passwordResetRequestedAt: { $exists: false } },
+          { passwordResetRequestedAt: null },
+          { passwordResetRequestedAt: { $lte: cooldown } },
+        ],
+      },
+      {
+        $set: {
+          passwordResetToken: tokenHash,
+          passwordResetExpires: new Date(
+            now.getTime() + 15 * 60 * 1000
+          ),
+          passwordResetRequestedAt: now,
+        },
+      },
+      { returnDocument: "after" }
+    );
+
+    if (user) {
+      const link = new URL("/dashboard/reset", frontend.origin);
+      link.searchParams.set("token", token);
+
+      try {
+        await sendEmail(
+          user.email,
+          "Reset your EventSphere password",
+          `
+            <h2>Reset your password</h2>
+            <p>Use the link below to choose a new password.</p>
+            <p><a href="${link.href}">Reset Password</a></p>
+            <p>This link expires in 15 minutes and can only be used once.</p>
+            <p>If you did not request this, ignore this email.</p>
+          `,
+          `Reset your EventSphere password: ${link.href}\n\nThis link expires in 15 minutes.`
+        );
+      } catch (error) {
+        await User.updateOne(
+          {
+            _id: user._id,
+            passwordResetToken: tokenHash,
+          },
+          {
+            $unset: {
+              passwordResetToken: "",
+              passwordResetExpires: "",
+            },
+          }
+        );
+
+        console.error(
+          "Password reset email failed:",
+          error.code || "EMAIL_SEND_FAILED"
+        );
+      }
+    }
+
+    return res.status(200).json({
+      msg: "If an eligible account exists, a reset link will be emailed. Check your inbox and spam folder",
+    });
+  } catch {
+    return res.status(500).json({
+      msg: "Unable to process password recovery. Please try again",
+    });
+  }
+}
+
+async function resetPassword(req, res) {
+  try {
+    const { token, password } = req.body || {};
+
+    if (
+      typeof token !== "string" ||
+      !/^[a-f0-9]{64}$/.test(token)
+    ) {
+      return res.status(400).json({
+        msg: "Invalid reset link. Request a new one",
+      });
+    }
+
+    if (
+      typeof password !== "string" ||
+      password.length < 8 ||
+      Buffer.byteLength(password, "utf8") > 72 ||
+      !/\S/.test(password)
+    ) {
+      return res.status(400).json({
+        msg: "Password must be at least 8 characters and at most 72 bytes",
+      });
+    }
+
+    const tokenHash = hashToken(token);
+
+    const exists = await User.exists({
+      passwordResetToken: tokenHash,
+      passwordResetExpires: { $gt: new Date() },
+    });
+
+    if (!exists) {
+      return res.status(400).json({
+        msg: "This reset link has expired or already been used",
+      });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 12);
+
+    const user = await User.findOneAndUpdate(
+      {
+        passwordResetToken: tokenHash,
+        passwordResetExpires: { $gt: new Date() },
+      },
+      {
+        $set: {
+          password: hashedPassword,
+        },
+        $inc: {
+          tokenVersion: 1,
+        },
+        $unset: {
+          passwordResetToken: "",
+          passwordResetExpires: "",
+        },
+      },
+      { returnDocument: "after" }
+    );
+
+    if (!user) {
+      return res.status(400).json({
+        msg: "This reset link has expired or already been used",
+      });
+    }
+
+    return res.status(200).json({
+      msg: "Password updated successfully. Please log in again",
+    });
+  } catch {
+    return res.status(500).json({
+      msg: "Unable to reset password. Please try again",
+    });
+  }
+}
+
+export { verifyemail, resetPassword };
